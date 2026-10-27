@@ -5,16 +5,9 @@
 use crate::search::{Action, Item};
 use serde::{Deserialize, Serialize};
 use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
+use crate::util::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, clipboard_text, expand_env};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use windows::Win32::System::DataExchange::*;
-use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
-use windows::Win32::System::Memory::*;
-use windows::Win32::System::Ole::CF_UNICODETEXT;
-use windows::core::HSTRING;
-
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 
 const FILES: &[(&str, &[u8])] = &[
     ("yad.py", include_bytes!("yad.py")),
@@ -82,45 +75,9 @@ pub fn icon() -> String {
     dir().join("icon.png").to_string_lossy().into()
 }
 
-fn flow_plugin_dir() -> PathBuf {
-    PathBuf::from(std::env::var("APPDATA").unwrap_or_default()).join("FlowLauncher").join("Plugins").join("yad")
-}
-
-/// Unpacks the embedded scripts (when changed) and, once, takes the token and the
-/// dependencies from the old Flow Launcher plugin so nothing has to be set up again.
+/// Writes the embedded scripts to %APPDATA%\LiteLaunch\yad (when changed).
 pub fn install() {
-    let dir = dir();
-    let _ = std::fs::create_dir_all(&dir);
-    for (name, bytes) in FILES {
-        let path = dir.join(name);
-        if std::fs::read(&path).ok().as_deref() != Some(*bytes) {
-            let _ = std::fs::write(&path, bytes);
-        }
-    }
-    let flow = flow_plugin_dir();
-    let token = dir.join("token.json");
-    if !token.exists() && flow.join("config.json").exists() {
-        let _ = std::fs::copy(flow.join("config.json"), &token);
-    }
-    if !has_lib() && flow.join("lib").join("ymd").exists() {
-        copy_dir(&flow.join("lib"), &dir.join("lib"));
-    }
-}
-
-fn copy_dir(from: &Path, to: &Path) {
-    let _ = std::fs::create_dir_all(to);
-    let Ok(entries) = std::fs::read_dir(from) else { return };
-    for e in entries.flatten() {
-        let name = e.file_name();
-        if name == "__pycache__" || name == "flowlauncher" {
-            continue;
-        }
-        if e.path().is_dir() {
-            copy_dir(&e.path(), &to.join(&name));
-        } else {
-            let _ = std::fs::copy(e.path(), to.join(&name));
-        }
-    }
+    crate::util::unpack(&dir(), FILES);
 }
 
 fn has_lib() -> bool {
@@ -128,43 +85,8 @@ fn has_lib() -> bool {
 }
 
 fn has_token() -> bool {
-    let Some(v) = std::fs::read_to_string(dir().join("token.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s.trim_start_matches('\u{feff}')).ok())
-    else {
-        return false;
-    };
+    let Some(v) = crate::util::read_json(&dir().join("token.json")) else { return false };
     ["token_enc", "token"].iter().any(|k| v[k].as_str().is_some_and(|s| !s.is_empty()))
-}
-
-pub fn expand_env(s: &str) -> String {
-    let src = HSTRING::from(s);
-    let mut buf = vec![0u16; 1024];
-    let n = unsafe { ExpandEnvironmentStringsW(&src, Some(&mut buf)) } as usize;
-    if n == 0 || n > buf.len() {
-        return s.to_string();
-    }
-    String::from_utf16_lossy(&buf[..n - 1])
-}
-
-pub fn clipboard_text() -> String {
-    unsafe {
-        if OpenClipboard(None).is_err() {
-            return String::new();
-        }
-        let mut text = String::new();
-        if let Ok(h) = GetClipboardData(CF_UNICODETEXT.0 as u32) {
-            let hg = windows::Win32::Foundation::HGLOBAL(h.0);
-            let p = GlobalLock(hg) as *const u16;
-            if !p.is_null() {
-                let len = (0..).take_while(|&i| *p.add(i) != 0).count();
-                text = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
-                let _ = GlobalUnlock(hg);
-            }
-        }
-        let _ = CloseClipboard();
-        text
-    }
 }
 
 /// `https://music.yandex.ru/album/1/track/2/?utm=x` -> `https://music.yandex.ru/album/1/track/2`;
@@ -282,10 +204,8 @@ pub fn run(op: &Op, cfg: &YadConfig, python: &str) {
             let _ = Command::new("explorer.exe").arg(folder).spawn();
         }
         Op::InstallLib => {
-            // pip output is worth seeing: console python.exe next to pythonw.exe, in its own window.
-            let console = python.to_lowercase().replace("pythonw.exe", "python.exe");
-            let exe = if Path::new(&console).exists() { console } else { "python".into() };
-            let _ = Command::new(exe).arg(dir.join("build_lib.py")).current_dir(&dir).creation_flags(CREATE_NEW_CONSOLE).spawn();
+            // pip output is worth seeing: console python.exe, in its own window.
+            let _ = Command::new(crate::util::console_python(python)).arg(dir.join("build_lib.py")).current_dir(&dir).creation_flags(CREATE_NEW_CONSOLE).spawn();
         }
     }
 }
