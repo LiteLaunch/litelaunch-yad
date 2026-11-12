@@ -1,6 +1,6 @@
 # litelaunch-yad
 
-Yandex Music downloader, a built-in plugin of [LiteLaunch](https://github.com/Slava-Gusak/litelaunch)
+Yandex Music downloader, a built-in plugin of [LiteLaunch](https://github.com/LiteLaunch/litelaunch)
 (`yad <link>`). Lives in the launcher as the submodule `plugins/yad`.
 
 - `yad.rs`: the native part, compiled into the launcher. It checks the link, takes one from the
