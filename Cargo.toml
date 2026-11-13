@@ -1,0 +1,23 @@
+[package]
+name = "yad"
+version = "1.0.0"
+edition = "2024"
+description = "Yandex Music downloader for LiteLaunch"
+license = "MIT"
+
+[lib]
+path = "yad.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Built inside the launcher's checkout, where this repository is the submodule plugins/yad.
+litelaunch-plugin = { path = "../../sdk" }
+serde = { version = "1.0.229", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# Unwinding stays on: the SDK catches a panic instead of letting it take the launcher down.
+panic = "unwind"

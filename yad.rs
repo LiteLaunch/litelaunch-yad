@@ -1,12 +1,11 @@
-//! yad — Yandex Music downloader. Queries are answered here (URL check, clipboard, token
-//! presence); Python (plugins/yad/yad.py + ymd) runs only for the download itself.
-//! The scripts are embedded and unpacked to %APPDATA%\LiteLaunch\yad.
+//! yad — Yandex Music downloader, a LiteLaunch plugin (DLL). Queries are answered here (URL
+//! check, clipboard, token presence); Python (yad.py + ymd) runs only for the download itself.
+//! The scripts are embedded and unpacked to the plugin's data folder, %APPDATA%\LiteLaunch\yad.
 
-use crate::search::{Action, Item};
+use litelaunch_plugin::util::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, clipboard_text, expand_env};
+use litelaunch_plugin::{Action, After, Host, Info, Item, Plugin, Reply, export_plugin};
 use serde::{Deserialize, Serialize};
 use std::os::windows::process::CommandExt;
-use crate::util::{CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, clipboard_text, expand_env};
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 const FILES: &[(&str, &[u8])] = &[
@@ -15,6 +14,7 @@ const FILES: &[(&str, &[u8])] = &[
     ("build_lib.py", include_bytes!("build_lib.py")),
     ("requirements.txt", include_bytes!("requirements.txt")),
     ("icon.png", include_bytes!("icon.png")),
+    ("yad.ico", include_bytes!("yad.ico")),
 ];
 
 const HOSTS: &[&str] = &["music.yandex.ru", "music.yandex.com", "music.yandex.by", "music.yandex.kz", "music.yandex.uz"];
@@ -58,7 +58,7 @@ impl Default for YadConfig {
     }
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize)]
 pub enum Op {
     Download(String),
     SaveToken(String),
@@ -67,25 +67,21 @@ pub enum Op {
     InstallLib,
 }
 
-pub fn dir() -> PathBuf {
-    crate::config::dir().join("yad")
+#[derive(Default)]
+pub struct Yad;
+
+export_plugin!(Yad);
+
+fn icon(host: &Host) -> String {
+    host.data_dir.join("icon.png").to_string_lossy().into()
 }
 
-pub fn icon() -> String {
-    dir().join("icon.png").to_string_lossy().into()
+fn has_lib(host: &Host) -> bool {
+    host.data_dir.join("lib").join("ymd").exists()
 }
 
-/// Writes the embedded scripts to %APPDATA%\LiteLaunch\yad (when changed).
-pub fn install() {
-    crate::util::unpack(&dir(), FILES);
-}
-
-fn has_lib() -> bool {
-    dir().join("lib").join("ymd").exists()
-}
-
-fn has_token() -> bool {
-    let Some(v) = crate::util::read_json(&dir().join("token.json")) else { return false };
+fn has_token(host: &Host) -> bool {
+    let Some(v) = litelaunch_plugin::util::read_json(&host.data_dir.join("token.json")) else { return false };
     ["token_enc", "token"].iter().any(|k| v[k].as_str().is_some_and(|s| !s.is_empty()))
 }
 
@@ -120,93 +116,121 @@ fn kind(url: &str) -> &'static str {
     TYPES.iter().find(|(part, _)| url.contains(part)).map_or("объект", |(_, name)| name)
 }
 
-fn item(title: impl Into<String>, sub: impl Into<String>, action: Action) -> Item {
-    Item::new(title, sub, Some(icon()), 0, action)
-}
+impl Plugin for Yad {
+    type Settings = YadConfig;
+    type Op = Op;
 
-pub fn search(cfg: &YadConfig, q: &str) -> Vec<Item> {
-    let folder = expand_env(&cfg.download_dir);
-    if !has_lib() {
-        return vec![item(
-            "Установить зависимости yad",
-            "Нет папки lib: Enter запустит pip (~16 МБ) в отдельном окне",
-            Action::Yad(Op::InstallLib),
-        )];
+    fn info(&self, host: &Host) -> Info {
+        Info {
+            name: "Yandex Music Downloader".into(),
+            description: "Скачивает треки, альбомы, плейлисты и артистов с Яндекс Музыки по ссылке".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            icon: Some(icon(host)),
+            ..Default::default()
+        }
     }
-    if !has_token() {
-        if q.starts_with("y0_") {
-            let short: String = q.chars().take(6).collect();
+
+    /// Writes the embedded scripts to the data folder (when changed).
+    fn init(&self, host: &Host) {
+        litelaunch_plugin::util::unpack(&host.data_dir, FILES);
+    }
+
+    fn query(&self, host: &Host, cfg: &YadConfig, q: &str) -> Reply {
+        let item = |title: String, sub: String, action: Action| Item::new(title, sub, Some(icon(host)), 0, action);
+        let folder = expand_env(&cfg.download_dir);
+        if !host.python_ok {
+            return vec![litelaunch_plugin::install_python_item(Some(icon(host)))].into();
+        }
+        if !has_lib(host) {
             return vec![item(
-                format!("Сохранить токен: {short}…"),
-                "Enter — проверить и сохранить (хранится зашифрованным, DPAPI)",
-                Action::Yad(Op::SaveToken(q.to_string())),
-            )];
+                "Установить зависимости yad".into(),
+                "Нет папки lib: Enter запустит pip (~16 МБ) в отдельном окне".into(),
+                Action::op(&Op::InstallLib),
+            )]
+            .into();
         }
-        return vec![item("Введите токен Яндекс Музыки", "Вставьте токен, начинающийся с y0_…", Action::Nothing)];
-    }
-    if q == "reset token" || q == "сбросить токен" {
-        return vec![item("Сбросить токен", "Enter — удалить сохранённый токен", Action::Yad(Op::ResetToken))];
-    }
-    let download = |url: String, title: String| {
-        let sub = format!("{url}  →  {folder}");
-        item(title, sub, Action::Yad(Op::Download(url)))
-    };
-    let open_folder = item("Открыть папку загрузок", folder.clone(), Action::Yad(Op::OpenFolder));
-    if q.is_empty() {
-        let first = match clean_url(&clipboard_text()) {
-            Some(url) => {
-                let title = format!("Скачать {} из буфера обмена", kind(&url));
-                download(url, title)
+        if !has_token(host) {
+            if q.starts_with("y0_") {
+                let short: String = q.chars().take(6).collect();
+                return vec![item(
+                    format!("Сохранить токен: {short}…"),
+                    "Enter — проверить и сохранить (хранится зашифрованным, DPAPI)".into(),
+                    Action::op(&Op::SaveToken(q.to_string())),
+                )]
+                .into();
             }
-            None => item("Вставьте ссылку на трек, альбом, плейлист или артиста", "Пример: yad https://music.yandex.ru/album/123", Action::Nothing),
+            return vec![item("Введите токен Яндекс Музыки".into(), "Вставьте токен, начинающийся с y0_…".into(), Action::Nothing)].into();
+        }
+        if q == "reset token" || q == "сбросить токен" {
+            return vec![item("Сбросить токен".into(), "Enter — удалить сохранённый токен".into(), Action::op(&Op::ResetToken))].into();
+        }
+        let download = |url: String, title: String| {
+            let sub = format!("{url}  →  {folder}");
+            item(title, sub, Action::op(&Op::Download(url)))
         };
-        return vec![first, open_folder];
-    }
-    match clean_url(q) {
-        Some(url) => {
-            let title = format!("Скачать {}", kind(&url));
-            vec![download(url, title), open_folder]
+        let open_folder = item("Открыть папку загрузок".into(), folder.clone(), Action::op(&Op::OpenFolder));
+        if q.is_empty() {
+            let first = match clean_url(&clipboard_text()) {
+                Some(url) => {
+                    let title = format!("Скачать {} из буфера обмена", kind(&url));
+                    download(url, title)
+                }
+                None => item(
+                    "Вставьте ссылку на трек, альбом, плейлист или артиста".into(),
+                    "Пример: yad https://music.yandex.ru/album/123".into(),
+                    Action::Nothing,
+                ),
+            };
+            return vec![first, open_folder].into();
         }
-        None => vec![item("Некорректная ссылка", "Ожидается ссылка на music.yandex.ru", Action::Nothing)],
+        match clean_url(q) {
+            Some(url) => {
+                let title = format!("Скачать {}", kind(&url));
+                vec![download(url, title), open_folder].into()
+            }
+            None => vec![item("Некорректная ссылка".into(), "Ожидается ссылка на music.yandex.ru".into(), Action::Nothing)].into(),
+        }
     }
-}
 
-/// Runs an action; downloads and token checks happen in a detached hidden Python process.
-pub fn run(op: &Op, cfg: &YadConfig, python: &str) {
-    let dir = dir();
-    let worker = |args: &[&str]| {
-        let mut cmd = Command::new(python);
-        cmd.arg("-B")
-            .arg(dir.join("yad.py"))
-            .args(args)
-            .current_dir(&dir)
-            .env("PYTHONIOENCODING", "utf-8")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        cmd
-    };
-    match op {
-        Op::Download(url) => {
-            let _ = worker(&["download", url]).spawn();
+    /// Downloads and token checks happen in a detached hidden Python process.
+    fn run(&self, host: &Host, cfg: &mut YadConfig, op: Op) -> After {
+        let dir = &host.data_dir;
+        let worker = |args: &[&str]| {
+            let mut cmd = Command::new(&host.python);
+            cmd.arg("-B")
+                .arg(dir.join("yad.py"))
+                .args(args)
+                .current_dir(dir)
+                .env("PYTHONIOENCODING", "utf-8")
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            cmd
+        };
+        match op {
+            Op::Download(url) => {
+                let _ = worker(&["download", &url]).spawn();
+            }
+            // The token goes through the environment so it never shows up in process lists.
+            Op::SaveToken(token) => {
+                let _ = worker(&["save_token"]).env("YAD_TOKEN", token).spawn();
+            }
+            Op::ResetToken => {
+                let _ = worker(&["reset_token"]).spawn();
+            }
+            Op::OpenFolder => {
+                let folder = expand_env(&cfg.download_dir);
+                let _ = std::fs::create_dir_all(&folder);
+                let _ = Command::new("explorer.exe").arg(folder).spawn();
+            }
+            Op::InstallLib => {
+                // pip output is worth seeing: console python.exe, in its own window.
+                let python = litelaunch_plugin::util::console_python(&host.python);
+                let _ = Command::new(python).arg(dir.join("build_lib.py")).current_dir(dir).creation_flags(CREATE_NEW_CONSOLE).spawn();
+            }
         }
-        // The token goes through the environment so it never shows up in process lists.
-        Op::SaveToken(token) => {
-            let _ = worker(&["save_token"]).env("YAD_TOKEN", token).spawn();
-        }
-        Op::ResetToken => {
-            let _ = worker(&["reset_token"]).spawn();
-        }
-        Op::OpenFolder => {
-            let folder = expand_env(&cfg.download_dir);
-            let _ = std::fs::create_dir_all(&folder);
-            let _ = Command::new("explorer.exe").arg(folder).spawn();
-        }
-        Op::InstallLib => {
-            // pip output is worth seeing: console python.exe, in its own window.
-            let _ = Command::new(crate::util::console_python(python)).arg(dir.join("build_lib.py")).current_dir(&dir).creation_flags(CREATE_NEW_CONSOLE).spawn();
-        }
+        After::Hide
     }
 }
 

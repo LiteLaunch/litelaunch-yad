@@ -24,6 +24,9 @@ import os
 YAD_DIR = os.path.dirname(os.path.abspath(__file__))
 LIB_PATH = os.path.join(YAD_DIR, "lib")
 sys.path.insert(0, LIB_PATH)
+# LiteLaunch's private Python (embeddable build) doesn't add the script's folder: ymd_fast lives here.
+if YAD_DIR not in sys.path:
+    sys.path.insert(1, YAD_DIR)
 
 import re
 import json
